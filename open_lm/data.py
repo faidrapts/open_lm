@@ -35,6 +35,7 @@ from webdataset.tariterators import (
     url_opener,
     tar_file_expander,
     valid_sample,
+    group_by_keys
 )
 from webdataset.mix import RandomMix
 
@@ -183,10 +184,10 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
 
 
 def tarfile_to_samples_nothrow(src, handler=log_and_continue):
-    # NOTE this is a re-impl of the webdataset impl with group_by_keys that doesn't throw
+    # NOTE BUG FIX replaced group by keys nothrow with original group by keys function
     streams = url_opener(src, handler=handler)
     files = tar_file_expander(streams, handler=handler)
-    samples = group_by_keys_nothrow(files, handler=handler)
+    samples = group_by_keys(files, handler=handler)
     return samples
 
 
