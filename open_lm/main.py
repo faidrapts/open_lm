@@ -212,7 +212,7 @@ def save_checkpoint(
 ):
     cpu_state, optim_state = None, None
     if args.logs and args.logs.lower() != "none" and args.fsdp:
-        save_policy = ShardedStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        save_policy = ShardedStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, save_policy):
             cpu_state = model.state_dict()
             optim_state = FSDP.optim_state_dict(model, optimizer)
