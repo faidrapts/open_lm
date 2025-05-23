@@ -104,7 +104,22 @@ def get_state_dict(name):
 
 
 def load_model(args, model, different_seed=False):
-    checkpoint = pt_load(args.resume, map_location="cpu")
+    # If FSDP is used, and checkpoints are saved with ShardedTensor objects (current behavior),
+    # only rank 0 should load the file directly. The content is then broadcast.
+    # This avoids the ShardedTensor.__setstate__ rank mismatch error on other ranks.
+    loaded_checkpoint_content = None
+    if args.fsdp:
+        # Ensure is_master and broadcast_object are correctly imported and available
+        # from .distributed import is_master, broadcast_object
+        if is_master(args):
+            loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
+        loaded_checkpoint_content = broadcast_object(args, loaded_checkpoint_content, src=0)
+    else:
+        # For non-FSDP models, or if FSDP checkpoints were saved as full state dicts,
+        # all ranks can load. Assuming current FSDP saves are sharded.
+        loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
+
+    checkpoint = loaded_checkpoint_content
     if "epoch" in checkpoint:
         if not different_seed and "shard_shuffle_seed" in checkpoint:
             pretrained_seed = checkpoint["shard_shuffle_seed"]
