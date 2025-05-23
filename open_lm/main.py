@@ -155,10 +155,7 @@ def load_model(args, model, different_seed=False):
                 if args.distributed: dist.barrier() # Sync before raising
                 raise FileNotFoundError(f"Rank {args.rank}: FSDP model shard not found at {shard_path}")
             if _shards_loaded_individually:
-                # When loading a sharded state dict, FSDP needs to be informed.
-                load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
-                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
-                    model.load_state_dict(sd)
+                model.load_state_dict(sd)
         elif args.distributed:
             model.module.load_state_dict(sd)
         else:
