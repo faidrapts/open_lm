@@ -228,17 +228,28 @@ def save_checkpoint(
     averagers=None,
     failed=False,
 ):
-    cpu_state, optim_state = None, None
+    sharded_sd, optim_state = None, None
     if args.logs and args.logs.lower() != "none" and args.fsdp:
         save_policy = ShardedStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, save_policy):
-            cpu_state = model.state_dict()
+            sharded_sd = model.state_dict()
             optim_state = FSDP.optim_state_dict(model, optimizer)
+            cpu_state_dict = {}
+            for param_name, sharded_param in sharded_sd.items():
+                full_param = sharded_param.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    cpu_state_dict[param_name] = full_param.cpu()
+                else:
+                    del full_param
+        save_path = args.checkpoint_path if not failed else args.failed_checkpoint_path
+        path = os.path.join(save_path, f"model_state_dict.pt")
+        torch.save(cpu_state_dict, path)
+        
     if args.save_logs:
         checkpoint_dict_model = {
             "epoch": completed_epoch,
             "name": args.name,
-            "state_dict": cpu_state if args.fsdp else model.state_dict(),
+            "state_dict": sharded_sd if args.fsdp else model.state_dict(),
             "evaluation_metrics": evaluation_metrics,
         }
         if next_shard_per_source is not None:
