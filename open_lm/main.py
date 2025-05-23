@@ -104,71 +104,68 @@ def get_state_dict(name):
 
 
 def load_model(args, model, different_seed=False):
-    # If FSDP is used, and checkpoints are saved with ShardedTensor objects (current behavior),
-    # only rank 0 should load the file directly. The content is then broadcast.
-    # This avoids the ShardedTensor.__setstate__ rank mismatch error on other ranks.
+    # If FSDP is used, and checkpoints are saved with ShardedTensor objects
     _shards_loaded_individually = False
     loaded_checkpoint_content = None
     if args.fsdp:
-        loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
+        if is_master(args):
+            loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
     else:
         # For non-FSDP models, or if FSDP checkpoints were saved as full state dicts,
         # all ranks can load. Assuming current FSDP saves are sharded.
         loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
 
-    checkpoint = loaded_checkpoint_content
-    if "epoch" in checkpoint:
-        if not different_seed and "shard_shuffle_seed" in checkpoint:
-            pretrained_seed = checkpoint["shard_shuffle_seed"]
-            assert (
-                pretrained_seed == args.seed
-            ), f"This checkpoint was trained with a random seed of {pretrained_seed}. Since this seed affects shard shuffling, resuming training must use the same seed."
-        else:
-            if different_seed:
-                message = "Resuming a checkpoint without checking that the seed match. This means that training might not be reproducible."
+    #TODO adapt this to work with other ranks too
+    if is_master(args):
+        checkpoint = loaded_checkpoint_content
+        if "epoch" in checkpoint:
+            if not different_seed and "shard_shuffle_seed" in checkpoint:
+                pretrained_seed = checkpoint["shard_shuffle_seed"]
+                assert (
+                    pretrained_seed == args.seed
+                ), f"This checkpoint was trained with a random seed of {pretrained_seed}. Since this seed affects shard shuffling, resuming training must use the same seed."
             else:
-                message = "Resuming a checkpoint that does not have a seed saved. This means that the shards were not shuffled, so they will remain unshuffled."
-            logging.info(message)
-            pretrained_seed = None
-
-        # resuming a train checkpoint w/ epoch and optimizer state
-        start_epoch = checkpoint["epoch"]
+                if different_seed:
+                    message = "Resuming a checkpoint without checking that the seed match. This means that training might not be reproducible."
+                else:
+                    message = "Resuming a checkpoint that does not have a seed saved. This means that the shards were not shuffled, so they will remain unshuffled."
+                logging.info(message)
+                pretrained_seed = None
         sd = checkpoint["state_dict"]
         global_step = checkpoint.get("step", None)
         if next(iter(sd.items()))[0].startswith("module"):
             sd = {k[len("module.") :]: v for k, v in sd.items()}
         if "_orig_mod" in next(iter(sd.items()))[0]:
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-        if args.fsdp:
-            checkpoint_dir = os.path.dirname(args.resume)
-            epoch_for_shard_name = start_epoch
-            shard_filename = f"model_rank_{args.rank}_epoch_{epoch_for_shard_name}.pt"
-            shard_path = os.path.join(checkpoint_dir, shard_filename)
+        # resuming a train checkpoint w/ epoch and optimizer state
+        
+        start_epoch = 1
+        
+    if args.fsdp:
+        checkpoint_dir = os.path.dirname(args.resume)
+        epoch_for_shard_name = start_epoch
+        shard_filename = f"model_rank_{args.rank}_epoch_{epoch_for_shard_name}.pt"
+        shard_path = os.path.join(checkpoint_dir, shard_filename)
 
-            if os.path.exists(shard_path):
-                logging.info(f"Rank {args.rank}: Loading FSDP model shard from {shard_path}")
-                sd = pt_load(shard_path, map_location="cpu")
-                _shards_loaded_individually = True
-            else:
-                logging.error(f"Rank {args.rank}: FSDP model shard not found at {shard_path}. Model loading will fail.")
-                if args.distributed: dist.barrier() # Sync before raising
-                raise FileNotFoundError(f"Rank {args.rank}: FSDP model shard not found at {shard_path}")
-            if _shards_loaded_individually:
-                # When loading a sharded state dict, FSDP needs to be informed.
-                load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
-                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
-                    model.load_state_dict(sd)
-        elif args.distributed:
-            model.module.load_state_dict(sd)
+        if os.path.exists(shard_path):
+            logging.info(f"Rank {args.rank}: Loading FSDP model shard from {shard_path}")
+            sd = pt_load(shard_path, map_location="cpu")
+            _shards_loaded_individually = True
         else:
-            model.load_state_dict(sd)
-        logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+            logging.error(f"Rank {args.rank}: FSDP model shard not found at {shard_path}. Model loading will fail.")
+            if args.distributed: dist.barrier() # Sync before raising
+            raise FileNotFoundError(f"Rank {args.rank}: FSDP model shard not found at {shard_path}")
+        if _shards_loaded_individually:
+            # When loading a sharded state dict, FSDP needs to be informed.
+            load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
+            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
+                model.load_state_dict(sd)
+    elif args.distributed:
+        model.module.load_state_dict(sd)
     else:
-        # loading a bare (model only) checkpoint for fine-tune or evaluation
-        start_epoch, global_step = 0, 0
-        pretrained_seed = None
-        model.load_state_dict(checkpoint)
-        logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
+        model.load_state_dict(sd)
+    logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
+    
     return start_epoch, global_step, pretrained_seed
 
 
