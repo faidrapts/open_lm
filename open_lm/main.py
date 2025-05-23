@@ -107,13 +107,11 @@ def load_model(args, model, different_seed=False):
     # If FSDP is used, and checkpoints are saved with ShardedTensor objects (current behavior),
     # only rank 0 should load the file directly. The content is then broadcast.
     # This avoids the ShardedTensor.__setstate__ rank mismatch error on other ranks.
+    _shards_loaded_individually = False
     loaded_checkpoint_content = None
     if args.fsdp:
-        # Ensure is_master and broadcast_object are correctly imported and available
-        # from .distributed import is_master, broadcast_object
         if is_master(args):
             loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
-        loaded_checkpoint_content = broadcast_object(args, loaded_checkpoint_content, src=0)
     else:
         # For non-FSDP models, or if FSDP checkpoints were saved as full state dicts,
         # all ranks can load. Assuming current FSDP saves are sharded.
@@ -143,10 +141,24 @@ def load_model(args, model, different_seed=False):
         if "_orig_mod" in next(iter(sd.items()))[0]:
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         if args.fsdp and args.fsdp_sharded_state_dict:
-            # When loading a sharded state dict, FSDP needs to be informed.
-            load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
-            with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
-                model.load_state_dict(sd)
+            checkpoint_dir = os.path.dirname(args.resume)
+            epoch_for_shard_name = start_epoch
+            shard_filename = f"model_rank_{args.rank}_epoch_{epoch_for_shard_name}.pt"
+            shard_path = os.path.join(checkpoint_dir, shard_filename)
+
+            if os.path.exists(shard_path):
+                logging.info(f"Rank {args.rank}: Loading FSDP model shard from {shard_path}")
+                sd = pt_load(shard_path, map_location="cpu")
+                _shards_loaded_individually = True
+            else:
+                logging.error(f"Rank {args.rank}: FSDP model shard not found at {shard_path}. Model loading will fail.")
+                if args.distributed: dist.barrier() # Sync before raising
+                raise FileNotFoundError(f"Rank {args.rank}: FSDP model shard not found at {shard_path}")
+            if _shards_loaded_individually:
+                # When loading a sharded state dict, FSDP needs to be informed.
+                load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
+                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
+                    model.load_state_dict(sd)
         elif args.distributed:
             model.module.load_state_dict(sd)
         else:
