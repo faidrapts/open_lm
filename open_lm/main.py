@@ -110,8 +110,7 @@ def load_model(args, model, different_seed=False):
     _shards_loaded_individually = False
     loaded_checkpoint_content = None
     if args.fsdp:
-        if is_master(args):
-            loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
+        loaded_checkpoint_content = pt_load(args.resume, map_location="cpu")
     else:
         # For non-FSDP models, or if FSDP checkpoints were saved as full state dicts,
         # all ranks can load. Assuming current FSDP saves are sharded.
