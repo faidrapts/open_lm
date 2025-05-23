@@ -265,9 +265,12 @@ def save_checkpoint(
             # Consolidate shards into a single file
             consolidated_model_state = {}
             for rank in range(args.world_size):
-                state = torch.load(f"model_rank_{rank}.pth")
+                model_shard_filename = f"model_rank_{args.rank}_epoch_{completed_epoch}.pt"
+                model_shard_path = os.path.join(save_path_dir, model_shard_filename)
+                state = torch.load(model_shard_path)
                 consolidated_model_state.update(state)
-            torch.save(consolidated_model_state, "full_model.pth")
+            full_path = os.path.join(save_path_dir, f"full_model_epoch_{completed_epoch}.pt")
+            torch.save(consolidated_model_state, full_path)
         except Exception as e:
             logging.error(f"Error consolidating FSDP model shards: {e}")
             pass
