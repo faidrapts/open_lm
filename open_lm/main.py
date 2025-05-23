@@ -230,21 +230,48 @@ def save_checkpoint(
 ):
     sharded_sd, optim_state = None, None
     if args.logs and args.logs.lower() != "none" and args.fsdp:
-        save_policy = ShardedStateDictConfig(offload_to_cpu=True, _use_dtensor=True)
+        save_policy = ShardedStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, save_policy):
             sharded_sd = model.state_dict()
             optim_state = FSDP.optim_state_dict(model, optimizer)
-            cpu_state_dict = {}
-            for param_name, sharded_param in sharded_sd.items():
-                full_param = sharded_param.full_tensor()
-                if torch.distributed.get_rank() == 0:
-                    cpu_state_dict[param_name] = full_param.cpu()
-                else:
-                    del full_param
-        save_path = args.checkpoint_path if not failed else args.failed_checkpoint_path
-        path = os.path.join(save_path, f"model_state_dict.pt")
-        torch.save(cpu_state_dict, path)
+            
+    # Determine if it's time to save based on frequency/completion
+    save_this_checkpoint_iteration = (
+        completed_epoch == args.epochs
+        or is_final_checkpoint
+        or (args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0)
+    )
+
+    # FSDP per-rank sharded model state_dict save.
+    # This runs on all ranks if FSDP is enabled and it's a save iteration.
+    if args.fsdp and save_this_checkpoint_iteration:
+        save_path_dir = args.checkpoint_path if not failed else args.failed_checkpoint_path
         
+        if sharded_sd is not None:
+            # Ensure os module is available if not already imported at the top of the file
+            # import os
+            # Ensure logging module is available if not already imported
+            # import logging
+            model_shard_filename = f"model_rank_{args.rank}_epoch_{completed_epoch}.pt"
+            model_shard_path = os.path.join(save_path_dir, model_shard_filename)
+            logging.info(f"Rank {args.rank}: Saving FSDP model shard to {model_shard_path}")
+            torch.save(sharded_sd, model_shard_path)
+        elif args.logs and args.logs.lower() != "none": # Log warning only if logs were enabled and sharded_sd is unexpectedly None
+            logging.warning(
+                f"Rank {args.rank}: sharded_sd is None. Skipping FSDP model shard save. "
+                "This is unexpected if FSDP is active and logging is enabled."
+            )
+        try:
+            # Consolidate shards into a single file
+            consolidated_model_state = {}
+            for rank in range(args.world_size):
+                state = torch.load(f"model_rank_{rank}.pth")
+                consolidated_model_state.update(state)
+            torch.save(consolidated_model_state, "full_model.pth")
+        except Exception as e:
+            logging.error(f"Error consolidating FSDP model shards: {e}")
+            pass
+            
     if args.save_logs:
         checkpoint_dict_model = {
             "epoch": completed_epoch,
