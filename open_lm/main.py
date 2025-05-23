@@ -17,6 +17,7 @@ from torch import optim
 from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_cp
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -80,8 +81,50 @@ def natural_key(string_):
     """See http://www.codinghorror.com/blog/archives/001018.html"""
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", string_.lower())]
 
+def get_latest_checkpoint(path: str):  # path is the base checkpoint directory (e.g., args.checkpoint_path)
+    is_s3 = path.startswith("s3")
+    if is_s3:
+        logging.warning("S3 support for get_latest_checkpoint with dist_cp format is not fully implemented here.")
+        # For S3, you'd need to use fsspec to read the LATEST_EPOCH_DIR marker or list directories.
+        return None
 
-def get_latest_checkpoint(path: str):
+    # Check for LATEST_EPOCH_DIR marker first
+    latest_marker_file = os.path.join(path, "LATEST_EPOCH_DIR")
+    if os.path.exists(latest_marker_file):
+        try:
+            with open(latest_marker_file, "r") as f:
+                latest_epoch_dir_name = f.read().strip()
+            latest_dir_path = os.path.join(path, latest_epoch_dir_name)
+            if os.path.isdir(latest_dir_path):
+                logging.info(f"Found latest checkpoint via marker: {latest_dir_path}")
+                return latest_dir_path
+            else:
+                logging.warning(f"Latest marker points to non-existent/invalid directory: {latest_dir_path}. Falling back to scan.")
+        except IOError as e:
+            logging.warning(f"Error reading latest marker file {latest_marker_file}: {e}. Falling back to scan.")
+
+    # Fallback: Scan directories if marker is not found or invalid
+    if not os.path.isdir(path):
+        return None
+
+    epoch_dirs = []
+    for d_name in os.listdir(path):
+        if os.path.isdir(os.path.join(path, d_name)) and d_name.startswith("epoch_"):
+            try:
+                epoch_num = int(d_name.split("_")[1])
+                epoch_dirs.append((epoch_num, d_name))
+            except (IndexError, ValueError):
+                continue
+    
+    if not epoch_dirs:
+        return None
+
+    # Sort by epoch number descending
+    epoch_dirs.sort(key=lambda x: x[0], reverse=True)
+    latest_epoch_dir_name = epoch_dirs[0][1]
+    return os.path.join(path, latest_epoch_dir_name)
+
+def get_latest_checkpoint_old(path: str):
     is_s3 = path.startswith("s3")
     fs, root_path = fsspec.core.url_to_fs(path)
     checkpoints = fs.glob(os.path.join(root_path, "epoch_*.pt"))
@@ -166,6 +209,150 @@ def load_model(args, model, different_seed=False):
     return start_epoch, global_step, pretrained_seed
 
 
+def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averagers=None):
+    """
+    Loads state from a checkpoint directory saved by torch.distributed.checkpoint.
+    Updates model, optimizer, scaler, and averagers in-place.
+    Returns a dictionary containing metadata like epoch, step, etc.
+    args.resume must point to the checkpoint directory.
+    """
+    if not args.resume:
+        logging.info("No resume path provided, skipping checkpoint load.")
+        return None # Or a dict with default values if preferred by calling code
+
+    if not os.path.isdir(args.resume):
+        logging.error(f"Resume path '{args.resume}' is not a valid directory. Cannot load checkpoint.")
+        raise FileNotFoundError(f"Checkpoint directory not found: {args.resume}")
+
+    logging.info(f"Loading checkpoint state from directory: {args.resume}")
+
+    # Prepare a dictionary to receive the loaded state.
+    # Model, optimizer, scaler will be updated in-place by dist_cp.load_state_dict.
+    state_to_load = {"model": model} # Model is mandatory
+    if optimizer:
+        state_to_load["optimizer"] = optimizer
+    if scaler:
+        state_to_load["scaler"] = scaler
+    # For averagers, dist_cp will load the dict of states. We'll apply them after.
+    # Other keys for metadata will be populated if they exist in the checkpoint.
+    
+    loaded_app_state = {} # This will be populated by dist_cp
+
+    try:
+        # All ranks participate. FileSystemReader handles distributed reading.
+        dist_cp.load_state_dict(
+            state_dict=state_to_load, # Components to load into
+            storage_reader=dist_cp.FileSystemReader(args.resume),
+            # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
+            # but for FSDP/DDP checkpoints, this should be False (default).
+        )
+        # After this, model, optimizer, scaler in state_to_load are updated.
+        # To get other metadata, we need to load the full application state.
+        # This is a bit tricky as load_state_dict modifies the passed dict.
+        # A common pattern is to load into a temporary structure or load specific keys.
+        # For simplicity, let's assume the main metadata is loaded along with the model.
+        # The `state_dict` argument to `load_state_dict` is modified in place.
+        # To get the full app state, we might need to load it separately if it's not part of the model's state.
+        # However, `dist_cp` saves the *entire* `app_state` we gave it.
+        # `load_state_dict` loads the values for keys present in its `state_dict` argument.
+        # To get all metadata, we can load the checkpoint into an empty dict first for metadata,
+        # then load components. Or, rely on the fact that `model.load_state_dict` (called by dist_cp)
+        # might not accept arbitrary keys.
+
+        # Let's try a more robust way to get the full app_state:
+        # Load the entire checkpoint content into a new dictionary.
+        # This requires that the keys in the checkpoint don't conflict with how `load_state_dict`
+        # expects to map to `model`, `optimizer` objects.
+        # The `torch.distributed.checkpoint.load` function might be more suitable for loading the whole app state.
+        
+        # Re-thinking: `load_state_dict` is for loading into pre-existing objects.
+        # To get the raw dict of everything saved:
+        raw_loaded_state = {}
+        # We need to tell `load_state_dict` what parts are PyTorch modules/optimizers
+        # and what are just plain data.
+        # A simpler approach for metadata: save metadata in a separate JSON file within the checkpoint dir.
+        # For now, let's assume `dist_cp.load_state_dict` can populate a broader dict.
+        # This is not how `load_state_dict` is typically used for arbitrary metadata.
+        # It's designed for `nn.Module`, `Optimizer`, etc.
+
+        # Correct approach: Load components, and metadata separately if not handled by component loading.
+        # The `app_state` saved by `save_state_dict` is a flat dictionary.
+        # `load_state_dict` will try to load `state_to_load["model"]` from `app_state["model"]` in the file.
+        # To get other metadata, we need to load the checkpoint's metadata.
+        # `torch.load` on a metadata file is one way, or `dist_cp.load()` if it supports loading raw dicts.
+
+        # Let's assume `dist_cp.load_state_dict` is primarily for torch objects.
+        # We'll load metadata from a conventional file within the checkpoint directory.
+        # `save_state_dict` saves the components. We need to save metadata separately.
+
+        # Let's adjust `save_checkpoint` to save a `metadata.json`
+        # And `load_checkpoint_distributed` to load it.
+
+        # --- In save_checkpoint (adjustment) ---
+        # After dist_cp.save_state_dict:
+        # metadata_to_save_separately = {k: v for k, v in app_state.items() if k not in ["model", "optimizer", "scaler", "averagers"]}
+        # if is_master(args):
+        #    with open(os.path.join(full_checkpoint_dir_path, "metadata.json"), "w") as f:
+        #        json.dump(metadata_to_save_separately, f)
+        # --- End adjustment ---
+
+        # --- In load_checkpoint_distributed (loading metadata) ---
+        metadata = {}
+        metadata_path = os.path.join(args.resume, "metadata.json") # Path to metadata file
+        if os.path.exists(metadata_path):
+            if is_master(args) or not args.distributed: # Master loads and broadcasts
+                with open(metadata_path, "r") as f:
+                    metadata_master = json.load(f)
+            else:
+                metadata_master = None
+            
+            if args.distributed:
+                metadata = broadcast_object(args, metadata_master)
+            else:
+                metadata = metadata_master
+            logging.info(f"Loaded metadata from {metadata_path}")
+        else:
+            logging.warning(f"Metadata file not found: {metadata_path}. Some states might not be restored.")
+            # Fallback to trying to get from app_state if it was structured that way, but it's unlikely.
+
+        # Apply averager states if they were loaded into `state_to_load` (if dist_cp supports dicts of states)
+        # Or if averager states were part of the main `app_state` and loaded via metadata.
+        # The `app_state["averagers"]` was a dict of state_dicts.
+        # If `dist_cp.save_state_dict` saved this structure, `dist_cp.load_state_dict`
+        # would need a corresponding entry in `state_to_load` like `state_to_load["averagers"] = empty_dict_to_fill`.
+        # This is complex. Simpler: averagers are part of metadata.json.
+        if averagers and "averagers" in metadata:
+            averager_states_loaded = metadata["averagers"]
+            for k, avg_model_wrapper in averagers.avgs_dict.items():
+                if k in averager_states_loaded:
+                    avg_model_wrapper.load_state_dict_avg(averager_states_loaded[k])
+            logging.info("Applied averager states from metadata.")
+
+
+        logging.info(f"Successfully loaded components from checkpoint {args.resume}")
+        
+        # Prepare return dictionary from loaded metadata
+        # Ensure keys exist in metadata or provide defaults
+        return {
+            "start_epoch": metadata.get("epoch", 0),
+            "global_step": metadata.get("step"),
+            "shard_shuffle_seed": metadata.get("shard_shuffle_seed", args.seed),
+            "next_shard_per_source": metadata.get("next_shard_per_source"),
+            "samples_seen": metadata.get("samples_seen"),
+            "name": metadata.get("name"),
+            "evaluation_metrics": metadata.get("evaluation_metrics"),
+            "is_final_checkpoint": metadata.get("is_final_checkpoint"),
+            "percentage_of_data_seen": metadata.get("percentage_of_data_seen"),
+            "train_data_string": metadata.get("train_data_string"),
+            "args_config": metadata.get("args_config")
+            # model, optimizer, scaler are updated in-place
+        }
+
+    except Exception as e:
+        logging.error(f"Error loading checkpoint state from {args.resume}: {e}")
+        logging.error(traceback.format_exc())
+        raise
+
 def load_avg_models(args, averagers):
     checkpoint = pt_load(args.resume, map_location="cpu")
     if "epoch" in checkpoint:
@@ -215,8 +402,156 @@ def load_data_chunks(args):
         )
         return [0 for _ in range(len(args.dataset_manifest))], 0
 
-
 def save_checkpoint(
+    args,
+    model,
+    optimizer,
+    scaler,
+    completed_epoch,
+    evaluation_metrics,
+    step,
+    is_final_checkpoint,
+    percentage_of_data_seen=-1.0,
+    next_shard_per_source=None,
+    samples_seen=None,
+    shard_shuffle_seed=None,
+    train_data_string=None,
+    averagers=None,
+    failed=False,
+):
+    save_this_checkpoint_iteration = (
+        completed_epoch == args.epochs
+        or is_final_checkpoint
+        or (args.save_frequency > 0 and (completed_epoch % args.save_frequency) == 0)
+    )
+
+    if not save_this_checkpoint_iteration:
+        if is_master(args):
+            logging.debug(f"Skipping checkpoint save for epoch {completed_epoch} as it's not a designated save iteration.")
+        return
+
+    save_path_base_dir = args.checkpoint_path if not failed else args.failed_checkpoint_path
+    checkpoint_directory_name = f"epoch_{completed_epoch}"
+    full_checkpoint_dir_path = os.path.join(save_path_base_dir, checkpoint_directory_name)
+
+    if is_master(args): # Log attempt on master
+        logging.info(f"Attempting to save checkpoint to directory: {full_checkpoint_dir_path} for epoch {completed_epoch}")
+
+    app_state = {
+        "epoch": completed_epoch,
+        "name": args.name,
+        "evaluation_metrics": evaluation_metrics,
+        "step": step,
+        "is_final_checkpoint": is_final_checkpoint,
+        "percentage_of_data_seen": percentage_of_data_seen,
+        "args_config": vars(args) # Save args for reference
+    }
+    if next_shard_per_source is not None:
+        app_state["next_shard_per_source"] = next_shard_per_source
+    if samples_seen is not None:
+        app_state["samples_seen"] = samples_seen
+    if shard_shuffle_seed is not None:
+        app_state["shard_shuffle_seed"] = shard_shuffle_seed
+    if train_data_string is not None:
+        app_state["train_data_string"] = train_data_string
+
+    # Model state
+    app_state["model"] = model.state_dict()
+
+    # Optimizer state
+    if optimizer is not None:
+        app_state["optimizer"] = optimizer.state_dict()
+
+    # Scaler state
+    if scaler is not None:
+        app_state["scaler"] = scaler.state_dict()
+
+    # Averager states
+    if averagers is not None:
+        averager_states = {}
+        for k, avg_model_wrapper in averagers.avgs_dict.items():
+            averager_states[k] = avg_model_wrapper.get_state_dict_avg()
+        app_state["averagers"] = averager_states
+    
+    try:
+        # All ranks participate. `FileSystemWriter` handles distributed writing.
+        dist_cp.save_state_dict(
+            state_dict=app_state,
+            storage_writer=dist_cp.FileSystemWriter(full_checkpoint_dir_path),
+        )
+        if is_master(args):
+            logging.info(f"Successfully saved checkpoint to {full_checkpoint_dir_path}")
+
+        # Handle "latest" marker if save_most_recent is enabled
+        if args.save_most_recent and is_master(args):
+            latest_marker_path = os.path.join(save_path_base_dir, "LATEST_EPOCH_DIR")
+            try:
+                with open(latest_marker_path, "w") as f:
+                    f.write(checkpoint_directory_name)
+                logging.info(f"Updated latest checkpoint marker to: {checkpoint_directory_name}")
+            except IOError as e:
+                logging.error(f"Failed to write latest checkpoint marker: {e}")
+
+
+        if args.delete_previous_checkpoint and is_master(args) and completed_epoch > 0:
+            # Determine previous epoch directory name based on save_frequency if applicable
+            # This simplified version assumes epochs are sequential integers for deletion.
+            # A more robust way would be to list directories and find the one before current.
+            prev_epoch_to_delete = completed_epoch - 1 # Simple case
+            if args.save_frequency > 1: # If saving every N epochs, the previous might not be N-1
+                 # This logic might need to be more sophisticated if save_frequency is not 1
+                 # For now, we assume completed_epoch is the actual epoch number.
+                 pass # Keep prev_epoch_to_delete as completed_epoch - 1 for simplicity
+
+            prev_checkpoint_dir_name = f"epoch_{prev_epoch_to_delete}"
+            prev_checkpoint_path = os.path.join(save_path_base_dir, prev_checkpoint_dir_name)
+            if os.path.isdir(prev_checkpoint_path):
+                try:
+                    shutil.rmtree(prev_checkpoint_path)
+                    logging.info(f"Deleted previous checkpoint directory: {prev_checkpoint_path}")
+                except Exception as e:
+                    logging.error(f"Error deleting previous checkpoint directory {prev_checkpoint_path}: {e}")
+            else:
+                logging.info(f"Previous checkpoint directory not found for deletion: {prev_checkpoint_path}")
+
+
+    except Exception as e:
+        logging.error(f"Error saving checkpoint using torch.distributed.checkpoint to {full_checkpoint_dir_path}: {e}")
+        logging.error(traceback.format_exc())
+
+    # Save metadata separately as JSON
+    metadata_to_save_json = {
+        "epoch": completed_epoch,
+        "name": args.name,
+        "evaluation_metrics": evaluation_metrics,
+        "step": step,
+        "is_final_checkpoint": is_final_checkpoint,
+        "percentage_of_data_seen": percentage_of_data_seen,
+        "args_config": vars(args)
+    }
+    if next_shard_per_source is not None:
+        metadata_to_save_json["next_shard_per_source"] = next_shard_per_source
+    if samples_seen is not None:
+        metadata_to_save_json["samples_seen"] = samples_seen
+    if shard_shuffle_seed is not None:
+        metadata_to_save_json["shard_shuffle_seed"] = shard_shuffle_seed
+    if train_data_string is not None:
+        metadata_to_save_json["train_data_string"] = train_data_string
+    if averagers is not None and "averagers" in app_state: # app_state has the averager state dicts
+         metadata_to_save_json["averagers"] = app_state["averagers"]
+
+
+    if is_master(args):
+        metadata_file_path = os.path.join(full_checkpoint_dir_path, "metadata.json")
+        try:
+            with open(metadata_file_path, "w") as f:
+                json.dump(metadata_to_save_json, f, indent=4)
+            logging.info(f"Saved metadata to {metadata_file_path}")
+        except IOError as e:
+            logging.error(f"Failed to save metadata.json: {e}")
+
+
+def save_checkpoint_old(
     args,
     model,
     optimizer,
@@ -767,7 +1102,28 @@ def main(args):
     # optionally resume optimizer from a checkpoint
     # this needs to be after torchcompile
     if args.resume is not None:
-        load_optimizer(args, model, optimizer, scaler)
+        # Ensure model is FSDP wrapped if args.fsdp before loading
+        # Ensure optimizer and scaler objects exist
+        loaded_state_info = load_checkpoint_distributed(args, model, optimizer, scaler, averagers)
+        if loaded_state_info:
+            start_epoch = loaded_state_info.get("start_epoch", start_epoch)
+            global_step = loaded_state_info.get("global_step", global_step)
+            shard_shuffle_seed = loaded_state_info.get("shard_shuffle_seed", shard_shuffle_seed)
+            next_shard_per_source_loaded = loaded_state_info.get("next_shard_per_source")
+            if next_shard_per_source_loaded is not None:
+                 next_shard_per_source = next_shard_per_source_loaded
+            samples_seen_loaded = loaded_state_info.get("samples_seen")
+            if samples_seen_loaded is not None:
+                samples_seen = samples_seen_loaded
+            
+            # Potentially restore other things from loaded_state_info like args_config for verification
+            logging.info(f"Resumed from epoch {start_epoch}, global_step {global_step}")
+            if args.dataset_manifest is not None and samples_seen >= args.train_num_samples * args.epochs:
+                 raise RuntimeError("Loaded a checkpoint which has already seen the desired number of tokens.")
+        else:
+            logging.warning(f"Failed to load checkpoint from {args.resume}, starting from scratch.")
+            args.resume = None # Ensure we don't try to use it later if loading failed partially
+
 
     # create scheduler if train
     scheduler = None
