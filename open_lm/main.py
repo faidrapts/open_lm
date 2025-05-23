@@ -248,10 +248,6 @@ def save_checkpoint(
         save_path_dir = args.checkpoint_path if not failed else args.failed_checkpoint_path
         
         if sharded_sd is not None:
-            # Ensure os module is available if not already imported at the top of the file
-            # import os
-            # Ensure logging module is available if not already imported
-            # import logging
             model_shard_filename = f"model_rank_{args.rank}_epoch_{completed_epoch}.pt"
             model_shard_path = os.path.join(save_path_dir, model_shard_filename)
             logging.info(f"Rank {args.rank}: Saving FSDP model shard to {model_shard_path}")
@@ -261,19 +257,40 @@ def save_checkpoint(
                 f"Rank {args.rank}: sharded_sd is None. Skipping FSDP model shard save. "
                 "This is unexpected if FSDP is active and logging is enabled."
             )
-        try:
-            # Consolidate shards into a single file
-            consolidated_model_state = {}
-            for rank in range(args.world_size):
-                model_shard_filename = f"model_rank_{args.rank}_epoch_{completed_epoch}.pt"
-                model_shard_path = os.path.join(save_path_dir, model_shard_filename)
-                state = torch.load(model_shard_path)
-                consolidated_model_state.update(state)
-            full_path = os.path.join(save_path_dir, f"full_model_epoch_{completed_epoch}.pt")
-            torch.save(consolidated_model_state, full_path)
-        except Exception as e:
-            logging.error(f"Error consolidating FSDP model shards: {e}")
-            pass
+            
+        # Synchronize all processes before consolidating shards
+        if args.distributed:
+            dist.barrier()
+
+        if is_master(args):
+            try:
+                # Consolidate shards into a single file on the master rank
+                consolidated_model_state = {}
+                logging.info(f"Master consolidating FSDP model shards for epoch {completed_epoch}.")
+                for rk in range(args.world_size):
+                    # Note: Iterating with rk to load shards from all ranks
+                    model_shard_filename = f"model_rank_{rk}_epoch_{completed_epoch}.pt"
+                    model_shard_path = os.path.join(save_path_dir, model_shard_filename)
+                    if os.path.exists(model_shard_path):
+                        logging.info(f"Master: Loading shard {model_shard_path}")
+                        state = torch.load(model_shard_path, map_location="cpu") # Load to CPU to save GPU memory
+                        consolidated_model_state.update(state)
+                    else:
+                        logging.warning(f"Master: Shard file not found {model_shard_path}, skipping.")
+                
+                if consolidated_model_state: # Ensure there's something to save
+                    full_path = os.path.join(save_path_dir, f"full_model_epoch_{completed_epoch}.pt")
+                    logging.info(f"Master: Saving consolidated FSDP model to {full_path}")
+                    torch.save(consolidated_model_state, full_path)
+                    logging.info(f"Master: Successfully consolidated FSDP model shards to {full_path}")
+                else:
+                    logging.warning("Master: No shards were loaded, skipping consolidation.")
+
+            except Exception as e:
+                logging.error(f"Master: Error consolidating FSDP model shards: {e}")
+                logging.error(traceback.format_exc()) # Add traceback for more details
+                # Depending on the desired behavior, you might want to re-raise or handle differently
+                pass # Current behavior is to log and continue
             
     if args.save_logs:
         checkpoint_dict_model = {
