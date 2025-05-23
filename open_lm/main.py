@@ -139,7 +139,7 @@ def load_model(args, model, different_seed=False):
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
         # resuming a train checkpoint w/ epoch and optimizer state
         
-        start_epoch = 1
+    start_epoch = 1
         
     if args.fsdp:
         checkpoint_dir = os.path.dirname(args.resume)
