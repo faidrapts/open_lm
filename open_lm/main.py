@@ -240,7 +240,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
 
     try:
         # All ranks participate. FileSystemReader handles distributed reading.
-        dist_cp.load_state_dict(
+        dist_cp.load(
             state_dict=state_to_load, # Components to load into
             storage_reader=dist_cp.FileSystemReader(args.resume),
             # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
@@ -457,6 +457,8 @@ def save_checkpoint(
 
     # Model state
     app_state["model"] = model.state_dict()
+    logging.info(f"Model state dict: {app_state['model'].keys()}")
+    
 
     # Optimizer state
     if optimizer is not None:
@@ -475,7 +477,7 @@ def save_checkpoint(
     
     try:
         # All ranks participate. `FileSystemWriter` handles distributed writing.
-        dist_cp.save_state_dict(
+        dist_cp.save(
             state_dict=app_state,
             storage_writer=dist_cp.FileSystemWriter(full_checkpoint_dir_path),
         )
