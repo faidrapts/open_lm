@@ -139,7 +139,7 @@ def load_model(args, model, different_seed=False):
             sd = {k[len("module.") :]: v for k, v in sd.items()}
         if "_orig_mod" in next(iter(sd.items()))[0]:
             sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
-        if args.fsdp and args.fsdp_sharded_state_dict:
+        if args.fsdp:
             checkpoint_dir = os.path.dirname(args.resume)
             epoch_for_shard_name = start_epoch
             shard_filename = f"model_rank_{args.rank}_epoch_{epoch_for_shard_name}.pt"
@@ -154,7 +154,10 @@ def load_model(args, model, different_seed=False):
                 if args.distributed: dist.barrier() # Sync before raising
                 raise FileNotFoundError(f"Rank {args.rank}: FSDP model shard not found at {shard_path}")
             if _shards_loaded_individually:
-                model.load_state_dict(sd)
+                # When loading a sharded state dict, FSDP needs to be informed.
+                load_policy = ShardedStateDictConfig(offload_to_cpu=True) # Or FullStateDictConfig if it was saved as full
+                with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, load_policy):
+                    model.load_state_dict(sd)
         elif args.distributed:
             model.module.load_state_dict(sd)
         else:
