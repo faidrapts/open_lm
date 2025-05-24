@@ -478,6 +478,11 @@ def save_checkpoint(
         "optimizer": app_state["optimizer"],
     }
     
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        optim_state = FSDP.optim_state_dict(app_state["model"], optimizer)
+    torch.save(optim_state, os.path.join(full_checkpoint_dir_path, "optimizer.pt"))
+    
     try:
         # All ranks participate. `FileSystemWriter` handles distributed writing.
         dist_cp.save(
