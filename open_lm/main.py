@@ -18,7 +18,6 @@ from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
-from torch.distributed.checkpoint.StorageReader import read_metadata
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -227,34 +226,13 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
 
     logging.info(f"Loading checkpoint state from directory: {args.resume}")
 
-    try:
-        # Read checkpoint metadata to see what components are available
-        checkpoint_metadata = read_metadata(args.resume)
-        available_components = checkpoint_metadata.state_dict_metadata.keys()
-
-        state_to_load = {"model": model}  # Model is always expected
-
-        if optimizer:
-            if "optimizer" in available_components:
-                state_to_load["optimizer"] = optimizer
-            else:
-                logging.warning(
-                    "Optimizer object provided for loading, but 'optimizer' key not found in checkpoint metadata. "
-                    "Optimizer state will not be loaded, and the current optimizer will retain its initial state."
-                )
-        
-        if scaler:
-            if "scaler" in available_components:
-                state_to_load["scaler"] = scaler
-            else:
-                logging.warning(
-                    "Scaler object provided for loading, but 'scaler' key not found in checkpoint metadata. "
-                    "Scaler state will not be loaded, and the current scaler will retain its initial state."
-                )
-    except Exception as e:
-        logging.error(f"Error loading checkpoint state from {args.resume}: {e}")
-        logging.error(traceback.format_exc())
-        raise  
+    state_to_load = {"model": model}  # Model is always expected
+    if optimizer:
+            state_to_load["optimizer"] = optimizer
+    
+    if scaler:
+            state_to_load["scaler"] = scaler
+            
     # For averagers, dist_cp will load the dict of states. We'll apply them after.
     # Other keys for metadata will be populated if they exist in the checkpoint.
     
