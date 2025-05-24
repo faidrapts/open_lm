@@ -145,7 +145,7 @@ def get_state_dict(name):
         sd = checkpoint
     return sd
 
-
+#TODO: revert this function to the original load_model
 def load_model(args, model, different_seed=False):
     # If FSDP is used, and checkpoints are saved with ShardedTensor objects
     _shards_loaded_individually = False
@@ -1092,17 +1092,6 @@ def main(args):
             assert not args.fsdp, "FSDP not supported with amp, only amp_bfloat16"
             scaler = GradScaler()
 
-    # initialize datasets
-    # use tokenizer=None because the data is already pre-tokenized.
-
-    data = get_data(
-        args,
-        epoch=start_epoch,
-        tokenizer=None,
-        skip_train=args.dataset_manifest is not None,
-        floor=args.dataset_manifest is not None,
-    )
-
     if args.target_mask_left is not None:
         # tokens handled with same modulo in dataloading
         args.target_mask_left = proc_token(args.target_mask_left, args.vocab_size)
@@ -1156,6 +1145,16 @@ def main(args):
                 else:
                     logging.warning("requires_training is true, but optimizer object is None. Cannot load optimizer state for file-based resume.")
             logging.info(f"State after file-based resume: epoch {start_epoch}, global_step {global_step}, samples_seen {samples_seen}")
+
+    # initialize datasets
+    # use tokenizer=None because the data is already pre-tokenized.
+    data = get_data(
+        args,
+        epoch=start_epoch,
+        tokenizer=None,
+        skip_train=args.dataset_manifest is not None,
+        floor=args.dataset_manifest is not None,
+    )
 
     # Final check for global_step if training is required and resume was attempted
     if requires_training and args.resume is not None and global_step is None:
