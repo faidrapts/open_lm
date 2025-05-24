@@ -228,7 +228,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
 
     state_to_load = {"model": model}  # Model is always expected
     if optimizer:
-            state_to_load["optim"] = optimizer
+            state_to_load["optimizer"] = optimizer
     
     if scaler:
             state_to_load["scaler"] = scaler
@@ -241,7 +241,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
     try:
         # All ranks participate. FileSystemReader handles distributed reading.
         dist_cp.load(
-            state_dict=state_to_load, # Components to load into
+            state_dict={"app": state_to_load}, # Components to load into
             storage_reader=dist_cp.FileSystemReader(args.resume),
             # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
             # but for FSDP/DDP checkpoints, this should be False (default).
@@ -459,7 +459,8 @@ def save_checkpoint(
     app_state["model"] = model.state_dict()
     logging.info(f"Model state dict: {app_state['model'].keys()}")
     
-    app_state["optim"] = optimizer.state_dict()
+    app_state["optimizer"] = optimizer.state_dict()
+    logging.info(f"Optimizer state dict: {app_state['optimizer'].keys()}")
 
     # Scaler state
     if scaler is not None:
@@ -475,7 +476,7 @@ def save_checkpoint(
     try:
         # All ranks participate. `FileSystemWriter` handles distributed writing.
         dist_cp.save(
-            state_dict=app_state,
+            state_dict={"app": app_state}, 
             storage_writer=dist_cp.FileSystemWriter(full_checkpoint_dir_path),
         )
         if is_master(args):
