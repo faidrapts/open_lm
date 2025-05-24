@@ -241,7 +241,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
     try:
         # All ranks participate. FileSystemReader handles distributed reading.
         dist_cp.load(
-            state_dict={"app": state_to_load}, # Components to load into
+            state_dict=state_to_load, # Components to load into
             storage_reader=dist_cp.FileSystemReader(args.resume),
             # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
             # but for FSDP/DDP checkpoints, this should be False (default).
