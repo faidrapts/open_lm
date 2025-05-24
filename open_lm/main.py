@@ -1005,8 +1005,23 @@ def main(args):
     # optionally resume model from a checkpoint
     start_epoch, global_step = 0, 0
     shard_shuffle_seed = args.seed
-    if args.resume is not None:
-        start_epoch, global_step, shard_shuffle_seed = load_model(args, model)
+    # Determine if args.resume points to a dist_cp directory
+    # This flag helps decide the loading strategy for args.resume
+    is_dist_cp_resume_path = args.resume is not None and os.path.isdir(args.resume)
+    
+    # if args.resume is not None:
+        # start_epoch, global_step, shard_shuffle_seed = load_model(args, model)
+    if args.resume is not None and not is_dist_cp_resume_path:
+    # args.resume is set, but it's not a directory. Assume it's an old-style file checkpoint.
+        if os.path.isfile(args.resume):
+            logging.info(f"Attempting to load model state from file: {args.resume} using load_model.")
+            start_epoch, global_step, shard_shuffle_seed = load_model(args, model)
+            # Optimizer, scaler, and data chunks for file-based resume will be handled after their respective objects are created.
+        else:
+            # args.resume path is not a directory and not a file.
+            logging.warning(f"Resume path '{args.resume}' is not a valid file or directory. Skipping resume attempt for this path.")
+            if not os.path.exists(args.resume): # If it doesn't exist at all
+                args.resume = None # Disable resume if path is invalid
 
     elif args.pretrained is not None:
         print("=> loading from a pre-trained model.")
@@ -1040,16 +1055,19 @@ def main(args):
     # Put the shard shuffle seed back into args (this is done for compatibility with older, non shuffling versions)
     args.shard_shuffle_seed = shard_shuffle_seed
 
-    if requires_training and global_step is None:
-        raise ValueError("Key 'step' not found in checkpoint, but required for training.")
+    if requires_training and global_step is None and args.resume is not None and not is_dist_cp_resume_path and os.path.isfile(args.resume) :
+        # This check is for file-based resumes where load_model might not have found 'step'.
+        # It's placed here as an early check; a more comprehensive check is done after all loading attempts.
+        logging.warning(f"For file-based resume from '{args.resume}', 'step' (global_step) was not found by load_model. It's required for training.")
 
     # Add data chunk when resuming (only for dataset without resampling)
     next_shard_per_source = [0 for _ in range(len(args.dataset_manifest))] if args.dataset_manifest is not None else 0
     samples_seen = 0
-    if args.resume is not None and args.dataset_manifest is not None:
+    if args.resume is not None and os.path.isfile(args.resume) and args.dataset_manifest is not None and not is_dist_cp_resume_path:
+        logging.info(f"Loading data chunks for file-based resume: {args.resume}")
         next_shard_per_source, samples_seen = load_data_chunks(args)
         if samples_seen >= args.train_num_samples * args.epochs:
-            raise RuntimeError("Loaded a checkpoint which has already seen the desired number of tokens.")
+            raise RuntimeError("Loaded a checkpoint (old-style file) which has already seen the desired number of tokens.")
 
     # create optimizer and scaler
     optimizer = None
@@ -1101,32 +1119,48 @@ def main(args):
             for k in averagers.avgs_dict:
                 averagers.avgs_dict[k].av_model = torch.compile(averagers.avgs_dict[k].av_model)
 
-    # optionally resume optimizer from a checkpoint
-    # this needs to be after torchcompile
+    # Resume handling:
+    # If is_dist_cp_resume_path is true, load_checkpoint_distributed will handle model, optimizer, scaler, and metadata.
+    # If args.resume is a file, model was loaded by load_model; now load optimizer/scaler if needed.
     if args.resume is not None:
-        # Ensure model is FSDP wrapped if args.fsdp before loading
-        # Ensure optimizer and scaler objects exist
-        loaded_state_info = load_checkpoint_distributed(args, model, optimizer, scaler, averagers)
-        if loaded_state_info:
-            start_epoch = loaded_state_info.get("start_epoch", start_epoch)
-            global_step = loaded_state_info.get("global_step", global_step)
-            shard_shuffle_seed = loaded_state_info.get("shard_shuffle_seed", shard_shuffle_seed)
-            next_shard_per_source_loaded = loaded_state_info.get("next_shard_per_source")
-            if next_shard_per_source_loaded is not None:
-                 next_shard_per_source = next_shard_per_source_loaded
-            samples_seen_loaded = loaded_state_info.get("samples_seen")
-            if samples_seen_loaded is not None:
-                samples_seen = samples_seen_loaded
-            
-            # Potentially restore other things from loaded_state_info like args_config for verification
-            logging.info(f"Resumed from epoch {start_epoch}, global_step {global_step}")
-            if args.dataset_manifest is not None and samples_seen >= args.train_num_samples * args.epochs:
-                 raise RuntimeError("Loaded a checkpoint which has already seen the desired number of tokens.")
-        else:
-            logging.warning(f"Failed to load checkpoint from {args.resume}, starting from scratch.")
-            args.resume = None # Ensure we don't try to use it later if loading failed partially
+        if is_dist_cp_resume_path:
+            # args.resume is a directory, use the comprehensive load_checkpoint_distributed
+            logging.info(f"Calling load_checkpoint_distributed for directory: {args.resume}")
+            loaded_state_info = load_checkpoint_distributed(args, model, optimizer, scaler, averagers)
+            if loaded_state_info:
+                start_epoch = loaded_state_info.get("start_epoch", start_epoch)
+                global_step = loaded_state_info.get("global_step", global_step)
+                args.shard_shuffle_seed = loaded_state_info.get("shard_shuffle_seed", args.shard_shuffle_seed) # Update args
+                
+                next_shard_per_source_loaded = loaded_state_info.get("next_shard_per_source")
+                if next_shard_per_source_loaded is not None:
+                    next_shard_per_source = next_shard_per_source_loaded
+                
+                samples_seen_loaded = loaded_state_info.get("samples_seen")
+                if samples_seen_loaded is not None:
+                    samples_seen = samples_seen_loaded
+                
+                logging.info(f"Resumed from dist_cp checkpoint: epoch {start_epoch}, global_step {global_step}, samples_seen {samples_seen}")
+                if args.dataset_manifest is not None and samples_seen >= args.train_num_samples * args.epochs:
+                    raise RuntimeError("Loaded a dist_cp checkpoint which has already seen the desired number of tokens.")
+            else:
+                logging.warning(f"load_checkpoint_distributed failed for {args.resume}. Training might start from scratch.")
+                args.resume = None # Nullify resume path if loading failed
+        elif os.path.isfile(args.resume):
+            # args.resume is a file: model already loaded by load_model.
+            # Load optimizer/scaler if training. Data chunks loaded earlier.
+            logging.info(f"Resuming optimizer/scaler for file-based checkpoint: {args.resume}")
+            if requires_training:
+                if optimizer:
+                    load_optimizer(args, model, optimizer, scaler)
+                else:
+                    logging.warning("requires_training is true, but optimizer object is None. Cannot load optimizer state for file-based resume.")
+            logging.info(f"State after file-based resume: epoch {start_epoch}, global_step {global_step}, samples_seen {samples_seen}")
 
-
+    # Final check for global_step if training is required and resume was attempted
+    if requires_training and args.resume is not None and global_step is None:
+        raise ValueError(f"After attempting to resume from {args.resume}, 'step' (global_step) is still None, but it is required for training.")
+       
     # create scheduler if train
     scheduler = None
     if requires_training:
