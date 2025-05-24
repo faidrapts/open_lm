@@ -18,7 +18,7 @@ from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
-from torch.distributed.checkpoint.metadata import read_metadata
+from torch.distributed.checkpoint.StorageReader import read_metadata
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
