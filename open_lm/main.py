@@ -472,11 +472,16 @@ def save_checkpoint(
         for k, avg_model_wrapper in averagers.avgs_dict.items():
             averager_states[k] = avg_model_wrapper.get_state_dict_avg()
         app_state["averagers"] = averager_states
+        
+    cp_state = {
+        "model": app_state["model"],
+        "optimizer": app_state["optimizer"],
+    }
     
     try:
         # All ranks participate. `FileSystemWriter` handles distributed writing.
         dist_cp.save(
-            state_dict={"app": app_state}, 
+            state_dict=cp_state, 
             storage_writer=dist_cp.FileSystemWriter(full_checkpoint_dir_path),
         )
         if is_master(args):
