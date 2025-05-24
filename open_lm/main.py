@@ -228,7 +228,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
 
     state_to_load = {"model": model}  # Model is always expected
     if optimizer:
-            state_to_load["optimizer"] = optimizer
+            state_to_load["optim"] = optimizer
     
     if scaler:
             state_to_load["scaler"] = scaler
@@ -459,7 +459,7 @@ def save_checkpoint(
     app_state["model"] = model.state_dict()
     logging.info(f"Model state dict: {app_state['model'].keys()}")
     
-    app_state["optimizer"] = optimizer.state_dict()
+    app_state["optim"] = optimizer.state_dict()
 
     # Scaler state
     if scaler is not None:
