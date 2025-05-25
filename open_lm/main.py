@@ -261,7 +261,20 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
             model_state_dict=model_state_dict,
             optim_state_dict=optimizer_state_dict
         )
-        optimizer.param_groups[0]['betas'] = (args.beta1, args.beta2)  # Ensure betas are set correctly
+        # print all keys in the nested structure of optimizer_state_dict
+        logging.info(f"Loaded optimizer state dict keys: {list(optimizer_state_dict.keys())}")
+        # print all values in the optimizer_state_dict up to 20 characters
+        for key, value in optimizer_state_dict.items():
+            if isinstance(value, dict):
+                logging.info(f"Optimizer state dict key '{key}' has sub-keys: {list(value.keys())}")
+            else:
+                logging.info(f"Optimizer state dict key '{key}' has value: {str(value)[:20]}...")
+                
+        optimizer.param_groups[0]['betas'] = (args.beta1, args.beta2) 
+        optimizer.param_groups[0]['lr'] = args.lr 
+        optimizer.param_groups[0]['eps'] = args.eps 
+        optimizer.param_groups[0]['weight_decay'] = args.wd 
+        
         # All ranks participate. FileSystemReader handles distributed reading.
         # dist_cp.load(
         #     state_dict=state_to_load, # Components to load into
