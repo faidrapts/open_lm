@@ -251,6 +251,8 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
             state_dict=state_dict,
             checkpoint_id=args.resume,
         )
+        # set betas to betas=(args.beta1, args.beta2),
+        optimizer_state_dict["param_groups"][0]['betas'] = (args.beta1, args.beta2)
         
         # sets our state dicts on the model and optimizer, now that we've loaded
         set_state_dict(
@@ -582,6 +584,35 @@ def save_checkpoint(
             logging.info(f"Saved metadata to {metadata_file_path}")
         except IOError as e:
             logging.error(f"Failed to save metadata.json: {e}")
+    
+    # save stats on rank 0
+    if is_master(args):
+        checkpoint_dict_stats = {
+        "epoch": completed_epoch,
+        "name": args.name,
+        "is_final_checkpoint": is_final_checkpoint,
+        "evaluation_metrics": evaluation_metrics,
+        "percentage_of_data_seen": percentage_of_data_seen,
+        }
+        if next_shard_per_source is not None:
+            checkpoint_dict_stats["next_shard_per_source"] = next_shard_per_source
+
+        if samples_seen is not None:
+            checkpoint_dict_stats["samples_seen"] = samples_seen
+
+        if step is not None:
+            checkpoint_dict_stats["step"] = step
+
+        if shard_shuffle_seed is not None:
+            checkpoint_dict_stats["shard_shuffle_seed"] = shard_shuffle_seed
+
+        if train_data_string is not None:
+            checkpoint_dict_stats["train_data_string"] = train_data_string
+            
+        torch.save(
+            checkpoint_dict_stats,
+            os.path.join(full_checkpoint_dir_path, f"stats_{completed_epoch}.pt"),
+        )
 
 
 def save_checkpoint_old(
