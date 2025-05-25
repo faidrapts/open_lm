@@ -18,6 +18,9 @@ from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.stateful import Stateful
+# from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -70,6 +73,35 @@ from open_lm.file_utils import (
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
+class AppState(Stateful):
+    """This is a useful wrapper for checkpointing the Application State. Since this object is compliant
+    with the Stateful protocol, DCP will automatically call state_dict/load_stat_dict as needed in the
+    dcp.save/load APIs.
+
+    Note: We take advantage of this wrapper to hande calling distributed state dict methods on the model
+    and optimizer.
+    """
+
+    def __init__(self, model, optimizer=None):
+        self.model = model
+        self.optimizer = optimizer
+
+    def state_dict(self):
+        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
+        model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
+        return {
+            "model": model_state_dict,
+            "optim": optimizer_state_dict
+        }
+
+    def load_state_dict(self, state_dict):
+        # sets our state dicts on the model and optimizer, now that we've loaded
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optim"]
+        )
 
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
@@ -239,13 +271,19 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
     loaded_app_state = {} # This will be populated by dist_cp
 
     try:
-        # All ranks participate. FileSystemReader handles distributed reading.
+
+        state_dict = { "app": AppState(model, optimizer)}
         dist_cp.load(
-            state_dict=state_to_load, # Components to load into
-            storage_reader=dist_cp.FileSystemReader(args.resume),
-            # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
-            # but for FSDP/DDP checkpoints, this should be False (default).
+            state_dict=state_dict,
+            checkpoint_id=args.resume,
         )
+        # All ranks participate. FileSystemReader handles distributed reading.
+        # dist_cp.load(
+        #     state_dict=state_to_load, # Components to load into
+        #     storage_reader=dist_cp.FileSystemReader(args.resume),
+        #     # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
+        #     # but for FSDP/DDP checkpoints, this should be False (default).
+        # )
         # After this, model, optimizer, scaler in state_to_load are updated.
         # To get other metadata, we need to load the full application state.
         # This is a bit tricky as load_state_dict modifies the passed dict.
@@ -478,16 +516,18 @@ def save_checkpoint(
         "optimizer": app_state["optimizer"],
     }
     
-    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        optim_state = FSDP.optim_state_dict(app_state["model"], optimizer)
-    torch.save(optim_state, os.path.join(full_checkpoint_dir_path, "optimizer.pt"))
+    # save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    # with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+    #     optim_state = FSDP.optim_state_dict(app_state["model"], optimizer)
+    # torch.save(optim_state, os.path.join(full_checkpoint_dir_path, "optimizer.pt"))
     
     try:
         # All ranks participate. `FileSystemWriter` handles distributed writing.
+        state_dict = { "app": AppState(model, optimizer) }
         dist_cp.save(
-            state_dict=cp_state, 
+            state_dict=state_dict, 
             storage_writer=dist_cp.FileSystemWriter(full_checkpoint_dir_path),
+            checkpoint_id=full_checkpoint_dir_path,
         )
         if is_master(args):
             logging.info(f"Successfully saved checkpoint to {full_checkpoint_dir_path}")
