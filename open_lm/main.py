@@ -261,8 +261,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
             model_state_dict=model_state_dict,
             optim_state_dict=optimizer_state_dict
         )
-        optimizer.load_state_dict(optimizer_state_dict)
-        
+        optimizer.param_groups[0]['betas'] = (args.beta1, args.beta2)  # Ensure betas are set correctly
         # All ranks participate. FileSystemReader handles distributed reading.
         # dist_cp.load(
         #     state_dict=state_to_load, # Components to load into
