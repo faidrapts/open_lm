@@ -261,6 +261,8 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
             model_state_dict=model_state_dict,
             optim_state_dict=optimizer_state_dict
         )
+        model.load_state_dict(model_state_dict)
+        optimizer.load_state_dict(optimizer_state_dict)
         
         # All ranks participate. FileSystemReader handles distributed reading.
         # dist_cp.load(
