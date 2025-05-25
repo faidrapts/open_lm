@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 import json
 import traceback
+import gc
 
 import fsspec
 import torch
@@ -18,7 +19,7 @@ from torch.cuda.amp import GradScaler
 
 import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict, get_model_state_dict, set_model_state_dict
 # from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
 from torch.distributed.fsdp import (
@@ -220,7 +221,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
     """
     if not args.resume:
         logging.info("No resume path provided, skipping checkpoint load.")
-        return None # Or a dict with default values if preferred by calling code
+        return None
 
     if not os.path.isdir(args.resume):
         logging.error(f"Resume path '{args.resume}' is not a valid directory. Cannot load checkpoint.")
@@ -235,103 +236,46 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
     if scaler:
             state_to_load["scaler"] = scaler
             
-    # For averagers, dist_cp will load the dict of states. We'll apply them after.
-    # Other keys for metadata will be populated if they exist in the checkpoint.
-    
-    loaded_app_state = {} # This will be populated by dist_cp
-
     try:
-        # generates the state dict we will load into
-        model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
-        state_dict = {
-            "model": model_state_dict,
-            "optimizer": optimizer_state_dict
-        }
-        dist_cp.load(
-            state_dict=state_dict,
-            checkpoint_id=args.resume,
-        )
-        # set betas to betas=(args.beta1, args.beta2),
-        optimizer_state_dict["param_groups"][0]['betas'] = (args.beta1, args.beta2)
+        if optimizer:
+            # generates the state dict we will load into
+            model_state_dict, optimizer_state_dict = get_state_dict(model, optimizer)
+            state_dict = {
+                "model": model_state_dict,
+                "optimizer": optimizer_state_dict
+            }
+            dist_cp.load(
+                state_dict=state_dict,
+                checkpoint_id=args.resume,
+            )
+            
+            # sets our state dicts on the model and optimizer, now that we've loaded
+            set_state_dict(
+                model,
+                optimizer,
+                model_state_dict=model_state_dict,
+                optim_state_dict=optimizer_state_dict
+            )
+                    
+            optimizer.param_groups[0]['betas'] = (args.beta1, args.beta2) 
+            optimizer.param_groups[0]['lr'] = args.lr 
+            optimizer.param_groups[0]['eps'] = args.eps 
+            optimizer.param_groups[0]['weight_decay'] = 0.0 # the first group has wd 0, the second args.wd
+            
+        else:
+            # generates the state dict we will load into
+            model_state_dict = get_model_state_dict(model)
+            state_dict = {"model": model_state_dict}
+            dist_cp.load(
+                state_dict=state_dict,
+                checkpoint_id=args.resume,
+            )
+            
+            set_model_state_dict(
+                model,
+                model_state_dict=model_state_dict,
+            )
         
-        # sets our state dicts on the model and optimizer, now that we've loaded
-        set_state_dict(
-            model,
-            optimizer,
-            model_state_dict=model_state_dict,
-            optim_state_dict=optimizer_state_dict
-        )
-        # print all keys in the nested structure of optimizer_state_dict
-        logging.info(f"Loaded optimizer state dict keys: {list(optimizer_state_dict.keys())}")
-        # print all values in the optimizer_state_dict up to 20 characters
-        for key, value in optimizer_state_dict.items():
-            if isinstance(value, dict):
-                logging.info(f"Optimizer state dict key '{key}' has sub-keys: {list(value.keys())}")
-            else:
-                logging.info(f"Optimizer state dict key '{key}' has value: {str(value)[:20]}...")
-                
-        optimizer.param_groups[0]['betas'] = (args.beta1, args.beta2) 
-        optimizer.param_groups[0]['lr'] = args.lr 
-        optimizer.param_groups[0]['eps'] = args.eps 
-        optimizer.param_groups[0]['weight_decay'] = args.wd 
-        
-        # All ranks participate. FileSystemReader handles distributed reading.
-        # dist_cp.load(
-        #     state_dict=state_to_load, # Components to load into
-        #     storage_reader=dist_cp.FileSystemReader(args.resume),
-        #     # no_dist=True can be used if loading a non-distributed checkpoint on a single rank,
-        #     # but for FSDP/DDP checkpoints, this should be False (default).
-        # )
-        # After this, model, optimizer, scaler in state_to_load are updated.
-        # To get other metadata, we need to load the full application state.
-        # This is a bit tricky as load_state_dict modifies the passed dict.
-        # A common pattern is to load into a temporary structure or load specific keys.
-        # For simplicity, let's assume the main metadata is loaded along with the model.
-        # The `state_dict` argument to `load_state_dict` is modified in place.
-        # To get the full app state, we might need to load it separately if it's not part of the model's state.
-        # However, `dist_cp` saves the *entire* `app_state` we gave it.
-        # `load_state_dict` loads the values for keys present in its `state_dict` argument.
-        # To get all metadata, we can load the checkpoint into an empty dict first for metadata,
-        # then load components. Or, rely on the fact that `model.load_state_dict` (called by dist_cp)
-        # might not accept arbitrary keys.
-
-        # Let's try a more robust way to get the full app_state:
-        # Load the entire checkpoint content into a new dictionary.
-        # This requires that the keys in the checkpoint don't conflict with how `load_state_dict`
-        # expects to map to `model`, `optimizer` objects.
-        # The `torch.distributed.checkpoint.load` function might be more suitable for loading the whole app state.
-        
-        # Re-thinking: `load_state_dict` is for loading into pre-existing objects.
-        # To get the raw dict of everything saved:
-        raw_loaded_state = {}
-        # We need to tell `load_state_dict` what parts are PyTorch modules/optimizers
-        # and what are just plain data.
-        # A simpler approach for metadata: save metadata in a separate JSON file within the checkpoint dir.
-        # For now, let's assume `dist_cp.load_state_dict` can populate a broader dict.
-        # This is not how `load_state_dict` is typically used for arbitrary metadata.
-        # It's designed for `nn.Module`, `Optimizer`, etc.
-
-        # Correct approach: Load components, and metadata separately if not handled by component loading.
-        # The `app_state` saved by `save_state_dict` is a flat dictionary.
-        # `load_state_dict` will try to load `state_to_load["model"]` from `app_state["model"]` in the file.
-        # To get other metadata, we need to load the checkpoint's metadata.
-        # `torch.load` on a metadata file is one way, or `dist_cp.load()` if it supports loading raw dicts.
-
-        # Let's assume `dist_cp.load_state_dict` is primarily for torch objects.
-        # We'll load metadata from a conventional file within the checkpoint directory.
-        # `save_state_dict` saves the components. We need to save metadata separately.
-
-        # Let's adjust `save_checkpoint` to save a `metadata.json`
-        # And `load_checkpoint_distributed` to load it.
-
-        # --- In save_checkpoint (adjustment) ---
-        # After dist_cp.save_state_dict:
-        # metadata_to_save_separately = {k: v for k, v in app_state.items() if k not in ["model", "optimizer", "scaler", "averagers"]}
-        # if is_master(args):
-        #    with open(os.path.join(full_checkpoint_dir_path, "metadata.json"), "w") as f:
-        #        json.dump(metadata_to_save_separately, f)
-        # --- End adjustment ---
-
         # --- In load_checkpoint_distributed (loading metadata) ---
         metadata = {}
         metadata_path = os.path.join(args.resume, "metadata.json") # Path to metadata file
@@ -349,14 +293,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
             logging.info(f"Loaded metadata from {metadata_path}")
         else:
             logging.warning(f"Metadata file not found: {metadata_path}. Some states might not be restored.")
-            # Fallback to trying to get from app_state if it was structured that way, but it's unlikely.
-
-        # Apply averager states if they were loaded into `state_to_load` (if dist_cp supports dicts of states)
-        # Or if averager states were part of the main `app_state` and loaded via metadata.
-        # The `app_state["averagers"]` was a dict of state_dicts.
-        # If `dist_cp.save_state_dict` saved this structure, `dist_cp.load_state_dict`
-        # would need a corresponding entry in `state_to_load` like `state_to_load["averagers"] = empty_dict_to_fill`.
-        # This is complex. Simpler: averagers are part of metadata.json.
+            
         if averagers and "averagers" in metadata:
             averager_states_loaded = metadata["averagers"]
             for k, avg_model_wrapper in averagers.avgs_dict.items():
@@ -388,6 +325,7 @@ def load_checkpoint_distributed(args, model, optimizer=None, scaler=None, averag
         logging.error(f"Error loading checkpoint state from {args.resume}: {e}")
         logging.error(traceback.format_exc())
         raise
+
 
 def load_avg_models(args, averagers):
     checkpoint = pt_load(args.resume, map_location="cpu")
@@ -626,6 +564,9 @@ def save_checkpoint(
             checkpoint_dict_stats,
             os.path.join(full_checkpoint_dir_path, f"stats_{completed_epoch}.pt"),
         )
+    
+    gc.collect()  # clean up memory after saving checkpoint
+    torch.cuda.empty_cache()  # clear CUDA memory cache
 
 
 def save_checkpoint_old(
