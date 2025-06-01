@@ -5,7 +5,7 @@ from dataclasses import fields
 from typing import List, Optional, Tuple, Union
 
 import torch
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto import AutoModelForCausalLM
@@ -40,7 +40,7 @@ def create_model_config_from_pretrained_config(config: OpenLMConfig):
     return model_config
 
 
-class OpenLMForCausalLM(PreTrainedModel):
+class OpenLMForCausalLM(PreTrainedModel, GenerationMixin):
     """
     Extremely barebones HF model wrapper.
     """
